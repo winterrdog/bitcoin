@@ -14,6 +14,8 @@
 #if (defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__DragonFly__))
 #include <pthread.h>
 #include <pthread_np.h>
+#elif defined(__NetBSD__)
+#include <pthread.h>
 #endif
 
 #if __has_include(<sys/prctl.h>)
@@ -33,6 +35,10 @@ static void SetThreadName(const char* name)
     ::prctl(PR_SET_NAME, name, 0, 0, 0);
 #elif (defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__DragonFly__))
     pthread_set_name_np(pthread_self(), name);
+#elif defined(__NetBSD__)
+    // NetBSD's limit is PTHREAD_MAX_NAMELEN_NP (typically 32 incl. NUL),
+    // well above what ThreadRename() ever passes in
+    pthread_setname_np(pthread_self(), "%s", const_cast<char*>(name));
 #elif defined(__APPLE__)
     pthread_setname_np(name);
 #elif defined(HAVE_SETTHREADDESCRIPTION)
