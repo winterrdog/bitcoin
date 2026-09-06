@@ -590,7 +590,7 @@ void HTTPRequest::WriteReply(HTTPStatusCode status, std::span<const std::byte> r
     }
 
     auto connection_header{m_headers.FindFirst("Connection")};
-    if (connection_header && ToLower(connection_header.value()) == "close") {
+    if (m_force_close || (connection_header && ToLower(connection_header.value()) == "close")) {
         // Might not exist already but we need to replace it, not append to it
         res.headers.RemoveAll("Connection");
 
@@ -904,14 +904,16 @@ void HTTPServer::SocketHandlerConnected(const IOReadiness& io_readiness) const
         if (recv_ready || err_ready) {
             client->Receive();
         }
-        // Process as much received data as we can.
-        // This executes for every client whether or not reading or writing
-        // took place because it also (might) parse a request we have already
-        // received and pass it to a worker thread.
-        if (std::unique_ptr<HTTPRequest> request{HTTPRemoteClient::TryReadRequest(client)})
-        {
-            LOCK(m_request_dispatcher_mutex);
-            m_request_dispatcher(std::move(request));
+
+        if (!client->IsLingering()) {
+            // Process as much received data as we can.
+            // This executes for every client whether or not reading or writing
+            // took place because it also (might) parse a request we have already
+            // received and pass it to a worker thread.
+            if (std::unique_ptr<HTTPRequest> request{HTTPRemoteClient::TryReadRequest(client)}) {
+                LOCK(m_request_dispatcher_mutex);
+                m_request_dispatcher(std::move(request));
+            }
         }
     }
 }
@@ -943,6 +945,12 @@ void HTTPRemoteClient::Receive()
             m_id);
         m_disconnect = true;
     } else {
+        if (IsLingering()) {
+            // Drop all the incoming bytes from this peer instead of
+            // relaying them to the request parser since parsing
+            // already failed for this connection.
+            return;
+        }
         // Reset idle timeout
         m_idle_since = Now<SteadySeconds>();
 
@@ -1060,8 +1068,9 @@ std::unique_ptr<HTTPRequest> HTTPRemoteClient::TryReadRequest(const std::shared_
             client->m_id,
             e.what());
 
+        client->m_lingering = HTTPRemoteClient::LingeringState::SendingReply;
+        client->m_req->MarkTerminating();
         WriteNoStoreErrorReply(*client->m_req, HTTP_CONTENT_TOO_LARGE);
-        client->m_disconnect = true;
         return nullptr;
     } catch (const std::runtime_error& e) {
         LogDebug(
@@ -1072,8 +1081,9 @@ std::unique_ptr<HTTPRequest> HTTPRemoteClient::TryReadRequest(const std::shared_
             e.what());
 
         // We failed to read a complete request from the buffer
+        client->m_lingering = HTTPRemoteClient::LingeringState::SendingReply;
+        client->m_req->MarkTerminating();
         WriteNoStoreErrorReply(*client->m_req, HTTP_BAD_REQUEST);
-        client->m_disconnect = true;
         return nullptr;
     }
 
@@ -1111,6 +1121,25 @@ void HTTPServer::DisconnectClients()
 
 bool HTTPRemoteClient::MaybeDisconnect(std::chrono::time_point<SteadyClock> now, std::chrono::seconds rpcservertimeout, bool disconnect_all)
 {
+    // Lingering clients follow their own lifecycle: never dropped
+    // just because the normal request/response cycle has stopped or
+    // the idle-timeout checks out as true. They are only
+    // disconnected on peer EOF/error or once their own lingering
+    // deadline has expired.
+    if (IsLingering()) {
+        const bool timed_out{m_lingering == LingeringState::Draining &&
+                             Now<SteadyMilliseconds>() > m_lingering_deadline};
+        if (m_disconnect || timed_out) {
+            LogDebug(BCLog::HTTP,
+                     "Disconnecting lingering HTTP client %s (id=%llu)%s",
+                     m_origin,
+                     m_id,
+                     timed_out ? " (lingering timeout)" : "");
+            return true;
+        }
+        return false;
+    }
+
     // First check for idle timeout. We reset the timer when we send and receive data,
     // but if the server is busy handling a request we should ignore the timeout until
     // the reply is sent. If we did erase the shared_ptr<HTTPRemoteClient> reference in m_connected
@@ -1122,7 +1151,6 @@ bool HTTPRemoteClient::MaybeDisconnect(std::chrono::time_point<SteadyClock> now,
                        !m_req_busy};
 
     // Disconnect this client due to error, end of communication, or idle timeout.
-    // May drop unsent data if we are closing due to error.
     if (m_disconnect || is_idle) {
         if (is_idle) {
             LogDebug(BCLog::HTTP,
@@ -1275,6 +1303,23 @@ bool HTTPRemoteClient::MaybeSendBytesFromBuffer()
         if (m_send_buffer.empty()) {
             m_send_ready = false;
             m_connection_busy = false;
+
+            // If we're trying to flush out an error reply as part of
+            // a lingering-close, do not drop a connection just yet.
+            // Shut down the write end of the socket(lets a peer know
+            // we're done talking) and start draining (read and
+            // discard) any incoming data a peer sends until they
+            // close, error or the lingering timeout expires. This
+            // avoids RSTing a peer that still has data mid-flight to us.
+            if (m_lingering == LingeringState::SendingReply) {
+                {
+                    LOCK(m_sock_mutex);
+                    static_cast<void>(m_sock->Shutdown(Sock::ShutdownHow::Write));
+                }
+                m_lingering = LingeringState::Draining;
+                m_lingering_deadline = Now<SteadyMilliseconds>() + LINGERING_CLOSE_TIMEOUT;
+                return true;
+            }
 
             // Our work is done here
             if (!m_keep_alive) {

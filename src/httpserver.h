@@ -202,6 +202,17 @@ public:
     State GetState() const { return m_state; }
     void SetState(State state) { m_state = state; }
 
+    // Mark this request's response as connection-terminating, overriding
+    // whatever the peer's (now-immutable) Connection header would
+    // otherwise negotiate. Used once transport-level lingering close has
+    // already decided this connection is ending because at that point the
+    // peer's original request headers are moot for connection-lifetime
+    // purposes, only our own decision matters.
+    //
+    // Must be called before WriteReply(): the flag is read once when the
+    // response is built, so calling this afterward has no effect.
+    void MarkTerminating() { m_force_close = true; }
+
 private:
     HTTPRequestMethod m_method;
     std::string m_target;
@@ -224,6 +235,15 @@ private:
     uint64_t m_chunk_read{0};
 
     State m_state = State::Init;
+
+    // Flag used to determine whether we should forcibly close at the
+    // HTTP protocal level regardless of the request's own Connection
+    // header or the HTTP version's default. Used when the connection
+    // is being torn down at the transport level (e.g. lingering
+    // close after a parse error) and the client must not be led to
+    // expect the connection will stay open. Only set and read in the
+    // I/O thread.
+    bool m_force_close{false};
 };
 
 class HTTPServer
@@ -528,6 +548,38 @@ public:
     const HTTPRequest* GetRequest() const { return m_req.get(); }
     //! @}
 
+    /**
+     * Transport-level lingering-close state, entered when HTTP parsing
+     * fails and we still need to:
+     * (a) flush an error reply to a peer and,
+     * (b) drain whatever data the peer still sends before we can
+     *     close without risking an RST on the data still mid-flight
+     *
+     * None         - normal operation.
+     * SendingReply - parsing failed; still flushing the error response to peer.
+     * Draining     - reply fully sent, write end shut down; now just reading and
+     *                discording until EOF/timeout/error.
+     */
+    enum class LingeringState {
+        None,
+        SendingReply,
+        Draining,
+    };
+
+    static constexpr auto LINGERING_CLOSE_TIMEOUT{5'000ms};
+
+    /**
+     * True once this connection has left normal operation and entered
+     * lingering close (SendingReply or Draining). While true,
+     * incoming bytes are discarded rather than parsed, and this
+     * client is exempt from the normal idle-timeout disconnect logic
+     * in MaybeDisconnect() - it's only removed via m_disconnect
+     * (peer EOF/error) or once m_lingering_deadline has passed.
+     * @returns false if the connection is in normal operation instead
+     *  a lingering close.
+     */
+    bool IsLingering() const { return m_lingering != LingeringState::None; }
+
 protected:
     //! Used for tests.
     std::string& MutateRecvBuffer() { return m_recv_buffer; }
@@ -625,6 +677,17 @@ private:
     //! Due to optimistic sends it may be updated in either a worker thread or in the
     //! I/O thread. It is checked in the I/O thread to disconnect idle clients.
     std::atomic<SteadySeconds> m_idle_since;
+
+    //! True once this client has left normal request/response handling
+    //! and entered lingering close (see LingeringState above) -
+    //! either still flushing an error reply or draining leftover peer
+    //! bytes before close. Only set and read on the I/O thread.
+    LingeringState m_lingering{LingeringState::None};
+
+    //! Set once, when we enter Draining. This is a hard cap on the
+    //! whole draining phase so a peer that keeps trickling data
+    //! cannot hold the connection open indefinitely.
+    SteadyMilliseconds m_lingering_deadline{};
 };
 
 /** Initialize HTTP server.
