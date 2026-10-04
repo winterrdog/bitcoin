@@ -418,6 +418,37 @@ void Sock::Close()
     m_socket = INVALID_SOCKET;
 }
 
+int Sock::Shutdown(ShutdownHow how)
+{
+    int native_how;
+#if defined(WIN32)
+    switch (how) {
+    case ShutdownHow::Read:
+        native_how = SD_RECEIVE;
+        break;
+    case ShutdownHow::Write:
+        native_how = SD_SEND;
+        break;
+    case ShutdownHow::Both:
+        native_how = SD_BOTH;
+        break;
+    }
+#else
+    switch (how) {
+    case ShutdownHow::Read:
+        native_how = SHUT_RD;
+        break;
+    case ShutdownHow::Write:
+        native_how = SHUT_WR;
+        break;
+    case ShutdownHow::Both:
+        native_how = SHUT_RDWR;
+        break;
+    }
+#endif
+    return shutdown(m_socket, native_how);
+}
+
 bool Sock::operator==(SOCKET s) const
 {
     return m_socket == s;

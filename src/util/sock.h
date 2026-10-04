@@ -276,6 +276,21 @@ public:
      */
     bool operator==(SOCKET s) const;
 
+
+    enum class ShutdownHow {
+        Read,
+        Write,
+        Both,
+    };
+
+    /**
+     * Shut down one or both directions of the socket.
+     *
+     * @param how The direction(s) to shut down.
+     * @return 0 on success, or -1 on failure.
+     */
+    [[nodiscard]] virtual int Shutdown(ShutdownHow how);
+
 protected:
     /**
      * Contained socket. `INVALID_SOCKET` designates the object is empty.
